@@ -1,0 +1,19 @@
+# Edit guidance parameters
+lr: [0.002,0.001] # Range of learning rates corresponding to guidance_timestep_range
+optimization_steps: 5 # Number of optimization steps per denoising step
+guidance_timestep_range: [50,40] # Range of timesteps with guidance (e.g. timestep 50 -> 40 out of 50 timesteps)
+
+enable_gradient_checkpointing: True
+guidance_blocks_5b: [20]
+guidance_blocks_2b: [15]
+injection_blocks: [0]
+motion_temp: 2
+guidance_scale: 7
+num_inference_steps: 50
+source_prompt: ""
+device: 'cuda'
+height: 480
+width: 720
+threshloss: True # Threshold loss to only evaluate when AMF > 0
+argmax_motion_flow: True # Argmax reference motion flow
+prop_motion: 0.04 # MOFT % channels
