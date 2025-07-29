@@ -75,6 +75,7 @@ python motion_guidance.py --video_path ./assets/bmx-trees.mp4 --prompt "Leopard 
 - DiTFlow (-ρ<sub>t</sub>): `--loss_type flow --opt_mode emb`
 - SMM: `--loss_type smm --opt_mode latent`
 - MOFT: `--loss_type moft --opt_mode latent`
+- MotionClone: `--loss_type mclone --opt_mode latent`
 - Injection (No guidance + KV injection): `--no_guidance`
 - Backbone (No guidance): `--no_guidance --no_injection`
 

@@ -27,6 +27,8 @@ from guidance_utils.custom_embeddings import prepare_rotary_positional_embedding
 from guidance_utils.custom_modules import ModuleWithGuidance, InjectionProcessor
 from guidance_utils.motion_flow_utils import compute_motion_flow
 
+from einops import rearrange
+
 # suppress partial model loading warning
 logging.set_verbosity_error()
 
@@ -225,7 +227,7 @@ class Guidance(nn.Module):
         
         print("Loading features from motion video")
         self.motion_latent = self.load_latent()
-        if self.config.loss_type =='flow':
+        if self.config.loss_type =='flow' or self.config.loss_type =='mclone':
             self.motion_attn_features = self.load_attn_features()
         elif self.config.loss_type=='smm':
             self.motion_orig_features = self.load_features()
@@ -327,11 +329,46 @@ class Guidance(nn.Module):
             )
         for block_id in self.config.guidance_blocks:
             module = self.transformer.transformer_blocks[block_id].attn1.processor
-            attn_features[module.block_name] = compute_motion_flow(module.query, module.key, 
-                                                    h=self.patches_height, 
-                                                    w=self.patches_width, 
-                                                    temp=self.config.motion_temp, 
-                                                    argmax=self.config.argmax_motion_flow)
+            if self.config.save_mclone:
+                q = module.query[-1,:,226:,:]
+                k = module.key[-1,:,226:,:]
+                A_all = torch.matmul(q, k.transpose(-1,-2)) / torch.sqrt(torch.tensor(module.query.shape[-1], dtype=module.query.dtype, device=module.query.device))
+                A_all = F.softmax(A_all, dim=-1)
+                
+                # Temporal only
+                A_all = rearrange(A_all, 'h (f1 hw1) (f2 hw2) -> h f1 f2 hw1 hw2', hw1=self.patches_height*self.patches_width, hw2=self.patches_height*self.patches_width)
+                A_all = A_all.diagonal(dim1=-2, dim2=-1)
+                A_all = rearrange(A_all, 'h f1 f2 hw1 -> (h f1 hw1) f2')
+                
+                # Get top indices in last dimension of ref_attn (like torch.topk(tensor, k=1, dim=-1))
+                top_indices = torch.topk(A_all, k=1, dim=-1).indices
+
+                # Create binary values tensor matching key's sequence length
+                num_heads, seq_len, head_dim = k.shape
+                v = torch.zeros((1, num_heads, seq_len, 1), device=k.device, dtype=k.dtype)
+                
+                # Fill values with 1.0 at positions specified by top_indices
+                for i in range(top_indices.shape[0]):
+                    v[0, :, top_indices[i], 0] = 1.0
+                
+                # Compute attention
+                reference_motion_representation = F.scaled_dot_product_attention(
+                    q,                  # [1, H, S, D]
+                    k,                  # [1, H, S, D]
+                    v,                  # [1, H, S, 1]
+                    attn_mask=None,
+                    dropout_p=0.0,
+                    is_causal=False
+                )
+                reference_motion_representation = reference_motion_representation.flatten(end_dim=-2)
+
+                attn_features[module.block_name] = reference_motion_representation, v
+            else:
+                attn_features[module.block_name] = compute_motion_flow(module.query, module.key, 
+                                                        h=self.patches_height, 
+                                                        w=self.patches_width, 
+                                                        temp=self.config.motion_temp, 
+                                                        argmax=self.config.argmax_motion_flow)
         
             self.transformer.transformer_blocks[block_id].attn1.processor.copy_kv = False
             self.transformer.transformer_blocks[block_id].attn1.processor.key = None
@@ -509,6 +546,60 @@ class Guidance(nn.Module):
             total_loss /= len(self.config.guidance_blocks)
         
         return total_loss
+    
+    def compute_mclone_loss(self, x, ts, rope=None, pos_emb=None):
+        """MotionClone Loss"""
+        # Store target features
+        with torch.autocast(device_type="cuda", dtype=self.dtype):
+            self.transformer(
+                hidden_states=x,
+                encoder_hidden_states=self.guidance_embeds[1:2],
+                timestep=ts.expand(x.shape[0]).to('cuda'),
+                rope=rope,
+                pos_embedding=pos_emb,
+                return_dict=False,
+            )
+
+        # Attention guidance
+        total_loss = 0
+        for block_id in self.config.guidance_blocks:
+            module = self.transformer.transformer_blocks[block_id].attn1.processor
+            target_name = module.block_name
+            # Get query and key, keeping original dimensions
+            q = module.query[-1,:,226:,:].unsqueeze(0)  # [1, H, S, D]
+            k = module.key[-1,:,226:,:].unsqueeze(0)    # [1, H, S, D]
+
+            # Get reference motion representation and indices
+            reference_motion_representation, v = self.motion_attn_features[target_name]
+            
+            # Compute attention
+            current_motion_representation = F.scaled_dot_product_attention(
+                q,                  # [1, H, S, D]
+                k,                  # [1, H, S, D]
+                v,                  # [1, H, S, 1]
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=False
+            )
+
+            # Reshape output to match reference_motion_representation
+            current_motion_representation = current_motion_representation.flatten(end_dim=-2)  # Remove batch dim
+
+            # Compute loss
+            attn_loss = F.mse_loss(current_motion_representation, reference_motion_representation.detach())
+
+            # Scale by mclone weight
+            attn_loss *= self.config.mclone_weight
+
+            total_loss += attn_loss
+        if len(self.config.guidance_blocks) > 0:
+            total_loss /= len(self.config.guidance_blocks)
+        
+        for block_id in self.config.guidance_blocks:
+            self.transformer.transformer_blocks[block_id].attn1.processor.query = None
+            self.transformer.transformer_blocks[block_id].attn1.processor.key = None
+            self.transformer.transformer_blocks[block_id].attn1.processor.value = None
+        return total_loss
 
     ############################## GUIDED DENOISING METHODS ##############################
     def guidance_step(self, x, i, t, mode, loss_type):
@@ -534,6 +625,8 @@ class Guidance(nn.Module):
             loss_method = self.compute_moft_loss
         elif loss_type == "smm":
             loss_method = self.compute_smm_loss
+        elif loss_type == "mclone":
+            loss_method = self.compute_mclone_loss
         else:
             print("Invalid loss type")
         
@@ -757,7 +850,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, default="5b", choices=['5b','2b'])
     parser.add_argument("-n", "--video_length", type=int, default=24, help="Load the first n frames of the video in video_path")
     parser.add_argument("--negative_prompt", type=str, default="bad quality, distortions, unrealistic, distorted image, watermark, signature", help="Negative prompt for new generation")
-    parser.add_argument("--loss_type", type=str, default="flow", choices=["flow", "moft", "smm"], help="Use MOFT or SMM for guidance")
+    parser.add_argument("--loss_type", type=str, default="flow", choices=["flow", "moft", "smm", "mclone"], help="Use MOFT, SMM or MotionClone for guidance")
     parser.add_argument("--opt_mode", type=str, default="latent", choices=["latent", "emb"])
     parser.add_argument("--no_guidance", action="store_true", help="Disable guidance")
     parser.add_argument("--no_injection", action="store_true", help="Disable KV injection")
@@ -789,6 +882,17 @@ if __name__ == "__main__":
         'verbose': opt.verbose,
     }
     config = OmegaConf.merge(config, cli_config)
+
+    if opt.loss_type == "mclone":
+        config.save_mclone = True
+        config.mclone_weight = 2000
+        config.motion_noise_timestep = 400
+        if opt.model == "5b":
+            config.guidance_blocks = [10]
+            config.score_guidance_scale = 50
+        elif opt.model=="2b":
+            config.guidance_blocks = [15]
+            config.score_guidance_scale = 100
 
     # Model-specific arguments
     config['guidance_blocks'] = config[f'guidance_blocks_{opt.model}']
